@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+pypdf
+openpyxl
+jinja2
+gspread
+google-auth
+bcrypt
