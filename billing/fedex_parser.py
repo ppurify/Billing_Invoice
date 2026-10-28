@@ -21,14 +21,13 @@ Address Correction
   Transportation 블록에 'Address Correction' 글자가 있으면 표시 (금액이 있으면 함께 추출)
   → 'Address Correction' 컬럼에 금액, 'Notes'에 메모, 화면에서는 해당 행을 빨간색으로 표시
 
-Channel(IBD / IBA / RED)
-  Other Charges → 항상 RED
-  나머지 → P.O.# / Ref.#2 / Cust. Ref를 보고 (대소문자 무시)
-           규칙 목록(키워드 → Channel)을 위에서부터 확인해서 처음 맞는 규칙의 Channel
-           아무 규칙에도 안 맞으면 RED
-  규칙은 구글 시트 'Channel Rules' 탭에만 있고 코드에는 없습니다 (components/channel_rules.py).
-  규칙을 넘기지 않으면(이 파일만 단독 실행 등) 모두 RED.
-  각 행에서 확인한 참조 값은 CHANNEL_REFS_COL(숨김 컬럼)에 남겨서, 규칙이 바뀌면 PDF를 다시 읽지 않고 재분류합니다.
+Channel
+  이 파서는 Channel을 정하지 않고(빈칸), 각 행에서 확인할 참조 값(P.O.# / Ref.#2 / Cust. Ref)만
+  CHANNEL_REFS_COL(숨김 컬럼)에 남깁니다. Channel은 앱이 channel_for()로 정합니다.
+    Other Charges         → 관리자가 정한 'Other Charges' Channel
+    나머지                 → 규칙(키워드 → Channel)을 위에서부터 확인, 처음 맞는 규칙의 Channel (대소문자 무시)
+    아무 규칙에도 안 맞으면  → 관리자가 정한 'No match' Channel
+  Channel 이름 · 키워드 규칙 · 기본 Channel은 모두 구글 시트에만 있고 코드에는 없습니다 (components/channel_rules.py).
 
 처리 방식
   모든 페이지를 레이아웃 그대로 읽고, 페이지마다 반복되는 상단 헤더를 지운 뒤 이어 붙입니다.
@@ -45,7 +44,6 @@ AMOUNT = r"-?[\d,]+\.\d{2}"
 # 섹션 · 유형 · Channel 이름
 EXPRESS, GROUND, GROUND_MW, OTHER = "Express", "Ground", "Ground Multiweight", "Other Charges"
 TRANSPORTATION, DUTY, OTHER_CHARGES = "Transportation", "Duty", "Other Charges"
-IBD, IBA, RED = "IBD", "IBA", "RED"
 CHANNEL_REFS_COL = "_channel_refs"   # Channel 구분에 쓴 참조 값 (화면 · Excel에는 안 나옴)
 
 DUTY_TOTAL_LABEL = "Total Duties, Tax, Customs, Other Fees"
@@ -122,18 +120,19 @@ def _refs_text(refs):
     return " ".join(str(r) for r in refs if r)
 
 
-def classify_channel(refs, rules=None):
-    """refs: 확인할 값 (목록 또는 이미 합친 문자열) · rules: [(키워드, Channel)] — 처음 맞는 규칙 적용, 없으면 RED"""
+def classify_channel(refs, rules, no_match=""):
+    """refs: 확인할 값 (목록 또는 이미 합친 문자열) · rules: [(키워드, Channel)]
+    처음 맞는 규칙의 Channel, 하나도 안 맞으면 no_match"""
     text = (refs if isinstance(refs, str) else _refs_text(refs)).upper()
     for keyword, channel in (rules or []):
         if keyword and keyword.upper() in text:
             return channel
-    return RED
+    return no_match
 
 
-def channel_for(section, refs_text, rules=None):
-    """행 하나의 Channel — Other Charges는 항상 RED"""
-    return RED if section == OTHER else classify_channel(refs_text or "", rules)
+def channel_for(section, refs_text, rules, no_match="", other_charges=""):
+    """행 하나의 Channel — Other Charges 섹션은 other_charges, 나머지는 규칙 → 안 맞으면 no_match"""
+    return other_charges if section == OTHER else classify_channel(refs_text or "", rules, no_match)
 
 
 def _split_blocks(text, start_re):
@@ -159,8 +158,7 @@ def _parse_express(block):
     ref2 = _field(r"Ref\.#2:", block)
     m = re.search(r"Tracking ID\s+(\d{9,})", block)
     tracking = m.group(1) if m else ""
-    channel = classify_channel([ref2, cust])
-    base = {"Section": EXPRESS, "Channel": channel, CHANNEL_REFS_COL: _refs_text([ref2, cust]), "Tracking ID": tracking,
+    base = {"Section": EXPRESS, "Channel": "", CHANNEL_REFS_COL: _refs_text([ref2, cust]), "Tracking ID": tracking,
             "Cust. Ref.": cust, "Reference": ref2}
 
     rows = []
@@ -188,7 +186,7 @@ def _parse_ground(block):
     po = _field(r"P\.O\.#:", block)
     m = re.search(r"Tracking ID\s+(\d{9,})", block)
     total = _money(r"Total Charge\s+USD", block)
-    return [{"Section": GROUND, "Type": TRANSPORTATION, "Channel": classify_channel([po, cust]),
+    return [{"Section": GROUND, "Type": TRANSPORTATION, "Channel": "",
              CHANNEL_REFS_COL: _refs_text([po, cust]),
              "Tracking ID": m.group(1) if m else "", "Cust. Ref.": cust, "Reference": po,
              "Total Charge": total, "Billed Amount": total, **_address_correction(block)}]
@@ -209,7 +207,7 @@ def _parse_ground_multiweight(block):
     total = _money(r"Shipment Total\s+[\d,.]+(?:\s*lbs)?", block)
     dest = _field(r"Destination Zip:", block)
     return [{"Section": GROUND_MW, "Type": TRANSPORTATION,
-             "Channel": classify_channel(cust_refs + pos), CHANNEL_REFS_COL: _refs_text(cust_refs + pos),
+             "Channel": "", CHANNEL_REFS_COL: _refs_text(cust_refs + pos),
              "Tracking ID": "", "Cust. Ref.": ", ".join(cust_refs),
              "Reference": ", ".join(pos) + (f" (Dest. Zip {dest})" if dest else ""),
              "Total Charge": total, "Billed Amount": total, **_address_correction(block)}]
@@ -218,7 +216,7 @@ def _parse_ground_multiweight(block):
 def _parse_other(block):
     total = _money(r"Total Charges\s+USD", block)
     # Other Charges도 Transportation으로 구분
-    return [{"Section": OTHER, "Type": TRANSPORTATION, "Channel": RED, "Total Charge": total, "Billed Amount": total}]
+    return [{"Section": OTHER, "Type": TRANSPORTATION, "Channel": "", "Total Charge": total, "Billed Amount": total}]
 
 
 PARSERS = {

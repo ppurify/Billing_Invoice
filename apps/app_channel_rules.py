@@ -23,19 +23,23 @@ is_admin = bool(user and user.get("is_admin"))
 EDITOR_VER = "rules_editor_ver"
 
 t1, t2 = st.columns([5, 1], vertical_alignment="center")
-t1.caption("Rules are checked from the top (Priority 1 first). The first keyword found in "
-           "P.O.# / Ref.#2 / Cust. Ref. decides the channel (case-insensitive). "
-           f"No match → {cr.DEFAULT_CHANNEL}. Other Charges are always {cr.DEFAULT_CHANNEL}.")
+caption_slot = t1.empty()
 if t2.button("🔄 Refresh", width="stretch", key="rules_refresh",
              help=f"Read the sheet again (otherwise refreshed every {cr.CACHE_TTL} s)"):
     cr.refresh()
 
 try:
-    s = cr.state()   # 탭 3개를 한 번에 읽고 잠시 재사용 (Google Sheets 읽기 한도 때문)
-    channels, rules, requests = s["channels"], s["rules"], s["requests"]
+    s = cr.state()   # 탭 4개를 한 번에 읽고 잠시 재사용 (Google Sheets 읽기 한도 때문)
+    channels, settings, rules, requests = s["channels"], s["settings"], s["rules"], s["requests"]
 except Exception as e:
     st.error(f"❌ Cannot read the rules sheet: {e}")
     st.stop()
+
+no_match = settings[cr.NO_MATCH] or cr.UNASSIGNED
+other_charges = settings[cr.OTHER_CHARGES] or cr.UNASSIGNED
+caption_slot.caption("Rules are checked from the top (Priority 1 first). The first keyword found in "
+                     "P.O.# / Ref.#2 / Cust. Ref. decides the channel (case-insensitive). "
+                     f"No match → **{no_match}**. Other Charges → **{other_charges}**.")
 
 ACTION_LABELS = {
     cr.ADD: "Add a keyword", cr.CHANGE: "Change a keyword", cr.DELETE: "Delete a keyword",
@@ -52,7 +56,7 @@ def _rules_df(rules):
 def _channels_df(channels, rules):
     used = pd.Series([r["Channel"].strip().upper() for r in rules]).value_counts() if rules else {}
     return pd.DataFrame([{"Order": i, "Channel": c, "Rules": int(used.get(c, 0)),
-                          "Note": "default (no match · Other Charges)" if c == cr.DEFAULT_CHANNEL else ""}
+                          "Default for": ", ".join(k for k, v in settings.items() if v == c)}
                          for i, c in enumerate(channels, start=1)])
 
 
@@ -113,8 +117,8 @@ if is_admin:
     # --- Channel 목록 ---
     st.markdown("---")
     st.markdown("### 🗂️ Edit Channels")
-    st.caption(f"Order = column order in the FedEx summary. {cr.DEFAULT_CHANNEL} is the default channel "
-               "and cannot be removed. A channel used by a rule cannot be removed.")
+    st.caption("Order: the column order of channels in the FedEx 'Other Charges by Channel' table "
+               "(empty = last). A channel used by a rule or as a default channel cannot be removed.")
     ch_edited = st.data_editor(
         _channels_df(channels, rules)[["Order", "Channel"]], key=f"channels_editor_{ver}",
         num_rows="dynamic", width="stretch", hide_index=True,
@@ -123,7 +127,7 @@ if is_admin:
     )
     if st.button("💾 Save channels", type="primary", key="channels_save"):
         new_channels = [str(r.Channel or "").strip().upper() for r in _sorted_rows(ch_edited, "Order").itertuples()]
-        errors = cr.validate_channels(new_channels, rules)
+        errors = cr.validate_channels(new_channels, rules, settings)
         if errors:
             st.error("❌ " + " / ".join(errors))
         else:
@@ -132,6 +136,27 @@ if is_admin:
                 _done(f"✅ Saved {len(new_channels)} channel(s).")
             except Exception as ex:
                 st.error(f"❌ Cannot save: {ex}")
+
+    # --- 기본 Channel ---
+    st.markdown("---")
+    st.markdown("### ⚙️ Default Channels")
+    st.caption("No match: rows whose references match no keyword. "
+               "Other Charges: the Other Charges section (pickup fees etc.), which has no references.")
+    d1, d2, d3 = st.columns([2, 2, 1], vertical_alignment="bottom")
+    picks = {}
+    for col, key in ((d1, cr.NO_MATCH), (d2, cr.OTHER_CHARGES)):
+        cur = settings[key]
+        picks[key] = col.selectbox(key, channels, index=channels.index(cur) if cur in channels else None,
+                                   key=f"default_{key}_{ver}", placeholder="Choose a channel")
+    if d3.button("💾 Save", type="primary", key="defaults_save", width="stretch"):
+        try:
+            err = cr.save_settings(picks, by=user["username"])
+        except Exception as ex:
+            err = str(ex)
+        if err:
+            st.error(f"❌ {err}")
+        else:
+            _done("✅ Default channels saved.")
 
     # --- 규칙 ---
     st.markdown("---")
@@ -174,7 +199,7 @@ else:
     if rules:
         st.dataframe(_rules_df(rules), width="stretch", hide_index=True)
     else:
-        st.caption(f"No rules. Every shipment is {cr.DEFAULT_CHANNEL}.")
+        st.caption(f"No rules yet. Every shipment is {no_match}.")
 
     st.markdown("---")
     st.markdown("### 📝 Request a Change")
@@ -197,9 +222,9 @@ else:
         priority = k2.number_input("Order (optional)", min_value=1, step=1, value=None, key="rq_order",
                                    help="Column position in the FedEx summary. Empty = last")
     elif action == cr.DEL_CH:
-        channel = k1.selectbox("Channel", [c for c in channels if c != cr.DEFAULT_CHANNEL], index=None,
+        channel = k1.selectbox("Channel", [c for c in channels if c not in settings.values()], index=None,
                                key="rq_channel_old", placeholder="Choose a channel",
-                               help="Only channels not used by any rule can be deleted.")
+                               help="Channels used by a rule or as a default channel cannot be deleted.")
     reason = st.text_input("Reason", key="rq_reason", placeholder="Why is this change needed?")
     if st.button("📨 Send request", type="primary", key="rq_send"):
         try:
@@ -233,5 +258,5 @@ with st.expander("🧪 Test a reference"):
         rule_pairs = [(r["Keyword"].strip(), r["Channel"].strip().upper()) for r in rules
                       if r["Channel"].strip().upper() in channels]
         hit = next((k for k, _ in rule_pairs if k and k.upper() in sample.upper()), None)
-        ch = classify_channel(sample, rule_pairs)
+        ch = classify_channel(sample, rule_pairs, no_match)
         st.markdown(f"→ **{ch}**" + (f" (matched keyword '{hit}')" if hit else " (no keyword matched)"))

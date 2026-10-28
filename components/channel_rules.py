@@ -3,9 +3,13 @@ Channel 목록 · 구분 규칙 (구글 시트에 저장, 코드에는 없음)
 
 탭 (Users와 같은 스프레드시트, 없으면 자동 생성)
   Channels      : 사용할 Channel 목록 (Order 순서 = FedEx 합계표 컬럼 순서)
-                  RED는 기본 Channel이라 항상 있고 지울 수 없음 (규칙에 안 맞는 행 · Other Charges)
-                  처음 만들 때는 RED + 'Channel Rules' 탭에서 이미 쓰고 있는 Channel로 채움
-  Channel Rules : 키워드 → Channel. Priority 순서대로 확인해서 처음 맞는 키워드의 Channel, 없으면 RED
+                  처음 만들 때는 'Channel Rules' 탭에서 이미 쓰고 있는 Channel로 채움
+  Channel Settings : 기본 Channel 2개 (관리자가 페이지에서 선택)
+                  No match      — 어떤 키워드에도 안 맞는 행
+                  Other Charges — Other Charges 섹션(Pickup 등, 참조 값이 없어 키워드로 구분 불가)
+                  정하지 않으면 해당 행은 'Unassigned'로 표시 (합계에서 빠지지 않게)
+                  여기서 쓰는 Channel과 규칙에서 쓰는 Channel은 삭제할 수 없음
+  Channel Rules : 키워드 → Channel. Priority 순서대로 확인해서 처음 맞는 키워드의 Channel
                   처음 만들어지면 비어 있음 → 관리자가 페이지에서 입력
   Rule Requests : 사용자의 변경 요청. 관리자가 Approve 하면 그때 반영
 
@@ -25,15 +29,17 @@ import re
 
 import streamlit as st
 
-from billing.fedex_parser import RED
 from components import gsheet
 
-CHANNELS_TAB, RULES_TAB, REQUESTS_TAB = "Channels", "Channel Rules", "Rule Requests"
+CHANNELS_TAB, SETTINGS_TAB, RULES_TAB, REQUESTS_TAB = "Channels", "Channel Settings", "Channel Rules", "Rule Requests"
 CH_HEADERS = ["Order", "Channel", "Updated At", "Updated By"]
+SET_HEADERS = ["Setting", "Channel", "Updated At", "Updated By"]
+NO_MATCH, OTHER_CHARGES = "No match", "Other Charges"
+SETTINGS = [NO_MATCH, OTHER_CHARGES]
+UNASSIGNED = "Unassigned"   # 기본 Channel을 아직 정하지 않았을 때 표시 이름
 RULE_HEADERS = ["Priority", "Keyword", "Channel", "Updated At", "Updated By"]
 REQ_HEADERS = ["Requested At", "Requested By", "Action", "Keyword", "Channel", "Priority", "Reason",
                "Reviewed At", "Reviewed By", "Status"]
-DEFAULT_CHANNEL = RED
 ADD, CHANGE, DELETE, ADD_CH, DEL_CH = "Add", "Change", "Delete", "Add Channel", "Delete Channel"
 ACTIONS = [ADD, CHANGE, DELETE, ADD_CH, DEL_CH]
 CHANNEL_ACTIONS = (ADD_CH, DEL_CH)
@@ -42,7 +48,7 @@ STATUSES = [PENDING, APPROVED, REJECTED]
 CACHE_TTL = 60   # 화면에 보이는 시트 내용의 최대 나이(초). 다른 사람이 바꾼 내용은 이 시간 안에 반영
 
 CHANNEL_RE = re.compile(r"^[A-Z0-9][A-Z0-9 _-]{0,19}$")
-RESERVED = {"TOTAL", "ROWS", "CATEGORY"}   # FedEx 합계표의 다른 컬럼 이름과 겹치지 않게
+RESERVED = {"TOTAL", "ROWS", "CATEGORY", UNASSIGNED.upper()}   # FedEx 합계표의 다른 컬럼 이름과 겹치지 않게
 
 
 def _key(text):
@@ -66,8 +72,8 @@ def _insert(items, item, position):
     items.insert(pos, item)
 
 
-# ── 시트 읽기 (탭 3개를 요청 1회로) ─────────────────────────────────────
-SPEC = {CHANNELS_TAB: CH_HEADERS, RULES_TAB: RULE_HEADERS, REQUESTS_TAB: REQ_HEADERS}
+# ── 시트 읽기 (탭 4개를 요청 1회로) ─────────────────────────────────────
+SPEC = {CHANNELS_TAB: CH_HEADERS, SETTINGS_TAB: SET_HEADERS, RULES_TAB: RULE_HEADERS, REQUESTS_TAB: REQ_HEADERS}
 
 
 def _last_row(rows):
@@ -88,25 +94,31 @@ def _load():
 
 
 def _read():
-    """시트에서 바로 읽기 → {channels, channel_rows, rules, rule_last, requests}"""
+    """시트에서 바로 읽기 → {channels, channel_rows, settings, setting_rows, rules, rule_last, requests}"""
     t = gsheet.read_tables(SPEC)
     _, rule_rows = t[RULES_TAB]
     rules = _sorted([r for r in rule_rows if r["Keyword"].strip()], "Priority")
 
     ch_created, ch_rows = t[CHANNELS_TAB]
-    if ch_created:   # 처음: RED + 이미 규칙에서 쓰고 있는 Channel
-        names = list(dict.fromkeys(c for c in (_key(r["Channel"]) for r in rules) if c and c != DEFAULT_CHANNEL))
-        names.append(DEFAULT_CHANNEL)
+    if ch_created:   # 처음: 이미 규칙에서 쓰고 있는 Channel
+        names = list(dict.fromkeys(c for c in (_key(r["Channel"]) for r in rules) if c))
         ch_rows = [{"Order": i, "Channel": n, "Updated At": gsheet.now(), "Updated By": "system", "row": i + 1}
                    for i, n in enumerate(names, start=1)]
         gsheet.write_rows(_ws(CHANNELS_TAB), CH_HEADERS, ch_rows, 0)
     names = list(dict.fromkeys(_key(r["Channel"]) for r in _sorted(ch_rows, "Order") if _key(r["Channel"])))
-    if DEFAULT_CHANNEL not in names:
-        names.append(DEFAULT_CHANNEL)
 
-    gsheet.ensure_dropdown(_ws(RULES_TAB), RULE_HEADERS.index("Channel"), names)
+    _, set_rows = t[SETTINGS_TAB]
+    settings = {k: "" for k in SETTINGS}
+    for r in set_rows:
+        if r["Setting"].strip() in settings and _key(r["Channel"]) in names:
+            settings[r["Setting"].strip()] = _key(r["Channel"])
+
+    if names:
+        gsheet.ensure_dropdown(_ws(RULES_TAB), RULE_HEADERS.index("Channel"), names)
+        gsheet.ensure_dropdown(_ws(SETTINGS_TAB), SET_HEADERS.index("Channel"), names)
     gsheet.ensure_dropdown(_ws(REQUESTS_TAB), REQ_HEADERS.index("Status"), STATUSES)
-    return {"channels": names, "channel_rows": ch_rows, "rules": rules,
+    return {"channels": names, "channel_rows": ch_rows, "settings": settings, "setting_rows": set_rows,
+            "rules": rules,
             "rule_last": _last_row(rule_rows), "requests": t[REQUESTS_TAB][1]}
 
 
@@ -130,6 +142,12 @@ def load_channels():
     return tuple(state()["channels"])
 
 
+def load_settings():
+    """FedEx 화면용: (No match Channel, Other Charges Channel) — 정하지 않았으면 ''"""
+    st_ = state()["settings"]
+    return st_[NO_MATCH], st_[OTHER_CHARGES]
+
+
 def load_rules():
     """FedEx 화면용: ((키워드, Channel), ...) — Priority 순. 목록에 없는 Channel의 규칙은 건너뜀"""
     s = state()
@@ -138,7 +156,7 @@ def load_rules():
 
 
 # ── Channel 목록 (Channels) ───────────────────────────────────────────
-def validate_channels(names, rules):
+def validate_channels(names, rules, settings=None):
     """Channel 목록 확인 → 오류 메시지 목록"""
     errors, seen = [], set()
     for i, n in enumerate(names, start=1):
@@ -149,8 +167,9 @@ def validate_channels(names, rules):
         elif n in seen:
             errors.append(f"Row {i}: '{n}' is duplicated.")
         seen.add(n)
-    if DEFAULT_CHANNEL not in seen:
-        errors.append(f"{DEFAULT_CHANNEL} is the default channel and cannot be removed.")
+    for key, ch in (settings or {}).items():
+        if ch and ch not in seen:
+            errors.append(f"'{ch}' is the '{key}' channel. Change it in Default Channels first.")
     used = {_key(r["Channel"]) for r in rules}
     for n in sorted(used - seen):
         errors.append(f"'{n}' is used by a rule. Change or delete those rules first.")
@@ -172,10 +191,12 @@ def _write_channels(names, by, s):
                     "Updated At": prev["Updated At"] if same else gsheet.now(),
                     "Updated By": prev["Updated By"] if same else by})
     gsheet.write_rows(_ws(CHANNELS_TAB), CH_HEADERS, out, _last_row(s["channel_rows"]))
-    gsheet.ensure_dropdown(_ws(RULES_TAB), RULE_HEADERS.index("Channel"), names)   # 규칙 탭 드롭다운도 새 목록으로
+    if names:   # 규칙 · 설정 탭 드롭다운도 새 목록으로
+        gsheet.ensure_dropdown(_ws(RULES_TAB), RULE_HEADERS.index("Channel"), names)
+        gsheet.ensure_dropdown(_ws(SETTINGS_TAB), SET_HEADERS.index("Channel"), names)
 
 
-def apply_channel_change(names, rules, action, name, order=None):
+def apply_channel_change(names, rules, action, name, order=None, settings=None):
     """Channel 목록에 요청 하나 적용 → (새 목록, 오류 메시지 또는 None)"""
     names, name = list(names), _key(name)
     if action == ADD_CH:
@@ -190,8 +211,9 @@ def apply_channel_change(names, rules, action, name, order=None):
     if action == DEL_CH:
         if name not in names:
             return names, f"Channel '{name}' does not exist."
-        if name == DEFAULT_CHANNEL:
-            return names, f"{DEFAULT_CHANNEL} is the default channel and cannot be deleted."
+        used_as = [k for k, ch in (settings or {}).items() if ch == name]
+        if used_as:
+            return names, f"Channel '{name}' is the '{', '.join(used_as)}' channel. Change it in Default Channels first."
         users = [r["Keyword"] for r in rules if _key(r["Channel"]) == name]
         if users:
             return names, f"Channel '{name}' is used by rule(s): {', '.join(users)}. Change or delete them first."
@@ -274,7 +296,7 @@ def describe(action, keyword, channel=None, priority=None):
 def _check(s, action, keyword, channel, priority):
     """지금 시트 기준으로 적용 가능한 요청인지 → (새 목록, 오류)"""
     if action in CHANNEL_ACTIONS:
-        return apply_channel_change(s["channels"], s["rules"], action, channel, priority)
+        return apply_channel_change(s["channels"], s["rules"], action, channel, priority, s.get("settings"))
     if not (keyword or "").strip():
         return None, "Please enter a keyword."
     if action != DELETE and _key(channel) not in s["channels"]:
@@ -326,7 +348,7 @@ def _apply_sheet_approvals(s):
             if r["Status"].strip().capitalize() == APPROVED and not r["Reviewed At"].strip()]
     if not todo:
         return False
-    cur = {"channels": list(s["channels"]), "rules": [dict(r) for r in s["rules"]]}
+    cur = {"channels": list(s["channels"]), "rules": [dict(r) for r in s["rules"]], "settings": s["settings"]}
     ch_changed = rule_changed = False
     updates = []
     for req in todo:
@@ -349,3 +371,23 @@ def _apply_sheet_approvals(s):
     gsheet.batch_update(_ws(REQUESTS_TAB), [{"range": f"{a}{row}:{z}{row}", "values": [[at, who, status]]}
                                            for row, at, who, status in updates])
     return ch_changed or rule_changed
+
+
+# ── 기본 Channel (Channel Settings) ──────────────────────────────────
+def save_settings(values, by):
+    """values: {No match: Channel, Other Charges: Channel} → 오류 메시지 또는 None"""
+    s = state(fresh=True)
+    for k in SETTINGS:
+        if _key(values.get(k)) not in s["channels"]:
+            return f"Choose a channel for '{k}'."
+    old = {r["Setting"].strip(): r for r in s["setting_rows"]}
+    out = []
+    for k in SETTINGS:
+        ch, prev = _key(values[k]), old.get(k)
+        same = prev and _key(prev["Channel"]) == ch
+        out.append({"Setting": k, "Channel": ch,
+                    "Updated At": prev["Updated At"] if same else gsheet.now(),
+                    "Updated By": prev["Updated By"] if same else by})
+    gsheet.write_rows(_ws(SETTINGS_TAB), SET_HEADERS, out, _last_row(s["setting_rows"]))
+    refresh()
+    return None

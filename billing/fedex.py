@@ -8,14 +8,15 @@ apps/app_fedex_billing.py 에서 render_fedex_billing()을 호출합니다.
   billing/fedex_parser.py : FedEx PDF 파싱, Channel 구분
 
 합계 기준
-  Transportation (Express 운송, Ground, Other Charges(Pickup 등, 항상 RED)) : Total Charge
+  Transportation (Express 운송, Ground, Other Charges(Pickup 등)) : Total Charge
   Duty (Express 관세)                    : Total Duties, Tax, Customs, Other Fees - (Customs Duty + MPF)
 
 Address Correction이 있는 Transportation 행은 빨간 글씨 + Notes에 메모
 
 Channel 목록 · 구분 규칙
   구글 시트 'Channels' 탭의 Channel 목록(합계표 컬럼 순서)과 'Channel Rules' 탭의 규칙으로 구분합니다
-  (Channel Rules 페이지에서 요청 · 승인 · 수정). 규칙에 안 맞는 행과 Other Charges는 RED.
+  (Channel Rules 페이지에서 요청 · 승인 · 수정). 규칙에 안 맞는 행과 Other Charges는
+  관리자가 정한 기본 Channel(No match / Other Charges) — 정하지 않았으면 'Unassigned'.
   규칙이 바뀌면 PDF를 다시 읽지 않고 이미 읽은 참조 값으로 다시 구분합니다 (최대 1분 뒤 반영).
   규칙은 시트에만 있고 코드에는 없습니다. 시트를 못 읽으면 잘못된 합계가 나오지 않도록 결과를 보여주지 않습니다.
 
@@ -40,11 +41,11 @@ import pandas as pd
 import streamlit as st
 
 from billing.fedex_parser import (
-    parse_fedex_invoice, TRANSPORTATION, DUTY, RED,
+    parse_fedex_invoice, TRANSPORTATION, DUTY,
     DUTY_TOTAL_LABEL, OTHER_FEES_COL, ADDRESS_CORRECTION_COL,
     CHANNEL_REFS_COL, channel_for,
 )
-from components.channel_rules import load_rules, load_channels
+from components.channel_rules import load_rules, load_channels, load_settings, UNASSIGNED
 
 MONEY_COLS = ["Total Charge", "Customs Duty", "Merchandise Processing Fee",
               DUTY_TOTAL_LABEL, OTHER_FEES_COL, ADDRESS_CORRECTION_COL, "Billed Amount"]
@@ -232,14 +233,18 @@ def render_fedex_billing():
     df_summary = pd.DataFrame(summaries)
     try:
         rules, channels = load_rules(), list(load_channels())
+        no_match, other_charges = load_settings()
     except Exception as e:
         st.error(f"❌ Cannot read Channels / Channel Rules from the sheet, so channels cannot be decided. "
                  f"Please try again in a moment. ({e})")
         return
     if not rules:
-        st.warning("⚠️ There are no Channel Rules yet, so every row is RED. "
-                   "Add rules on the 'Channel Rules' page.")
-    df_all["Channel"] = [channel_for(sec, refs, rules)                      # 현재 규칙으로 다시 구분
+        st.warning("⚠️ There are no Channel Rules yet. Add rules on the 'Channel Rules' page.")
+    if not (no_match and other_charges):
+        st.warning(f"⚠️ Default channels are not set, so some rows are '{UNASSIGNED}'. "
+                   "The administrator can set them in 'Channel Rules' → Default Channels.")
+    df_all["Channel"] = [channel_for(sec, refs, rules, no_match or UNASSIGNED,      # 현재 규칙으로 다시 구분
+                                     other_charges or UNASSIGNED)
                          for sec, refs in zip(df_all["Section"], df_all[CHANNEL_REFS_COL])]
     n_edited = _apply_channel_overrides(df_all)   # 직접 수정한 Channel 반영 (합계 · 다운로드 모두)
     # 목록에서 지워진 Channel로 직접 수정해 둔 행이 있어도 합계에서 빠지지 않게 뒤에 붙임
@@ -275,7 +280,7 @@ def render_fedex_billing():
     # 합계표 바로 위: 설명 ……… Download Excel (합계표)
     s1, s2 = st.columns([5, 1], vertical_alignment="bottom")
     s1.caption(
-        "Transportation = Total Charge (incl. Other Charges such as pickup fees, always RED) · "
+        f"Transportation = Total Charge (incl. Other Charges such as pickup fees → {other_charges or UNASSIGNED}) · "
         f"Duty = {DUTY_TOTAL_LABEL} − (Customs Duty + Merchandise Processing Fee)"
     )
     s2.download_button(
