@@ -1,7 +1,7 @@
 """
 FedEx Billing Invoice 페이지 (새 앱 전용)
 
-FedEx Invoice PDF 업로드 → 섹션별 추출 → IBD / IBA / RED 합계
+FedEx Invoice PDF 업로드 → 섹션별 추출 → Channel별 합계
 apps/app_fedex_billing.py 에서 render_fedex_billing()을 호출합니다.
 
 관련 파일
@@ -13,8 +13,9 @@ apps/app_fedex_billing.py 에서 render_fedex_billing()을 호출합니다.
 
 Address Correction이 있는 Transportation 행은 빨간 글씨 + Notes에 메모
 
-Channel 구분 규칙
-  구글 시트 'Channel Rules' 탭의 규칙으로 구분합니다 (Channel Rules 페이지에서 요청 · 승인 · 수정).
+Channel 목록 · 구분 규칙
+  구글 시트 'Channels' 탭의 Channel 목록(합계표 컬럼 순서)과 'Channel Rules' 탭의 규칙으로 구분합니다
+  (Channel Rules 페이지에서 요청 · 승인 · 수정). 규칙에 안 맞는 행과 Other Charges는 RED.
   규칙이 바뀌면 PDF를 다시 읽지 않고 이미 읽은 참조 값으로 다시 구분합니다 (최대 1분 뒤 반영).
   규칙은 시트에만 있고 코드에는 없습니다. 시트를 못 읽으면 잘못된 합계가 나오지 않도록 결과를 보여주지 않습니다.
 
@@ -39,13 +40,12 @@ import pandas as pd
 import streamlit as st
 
 from billing.fedex_parser import (
-    parse_fedex_invoice, TRANSPORTATION, DUTY, IBD, IBA, RED,
+    parse_fedex_invoice, TRANSPORTATION, DUTY, RED,
     DUTY_TOTAL_LABEL, OTHER_FEES_COL, ADDRESS_CORRECTION_COL,
     CHANNEL_REFS_COL, channel_for,
 )
-from components.channel_rules import load_rules
+from components.channel_rules import load_rules, load_channels
 
-CHANNELS = [IBD, IBA, RED]
 MONEY_COLS = ["Total Charge", "Customs Duty", "Merchandise Processing Fee",
               DUTY_TOTAL_LABEL, OTHER_FEES_COL, ADDRESS_CORRECTION_COL, "Billed Amount"]
 FLAG_COL = "Address Correction?"          # 파서가 만든 True/False 컬럼 (화면에는 숨김)
@@ -110,24 +110,24 @@ def _money_config(cols):
     return {c: st.column_config.NumberColumn(format="$%.2f") for c in cols}
 
 
-def _summary_records(df, invoice_no, invoice_date):
+def _summary_records(df, invoice_no, invoice_date, channels):
     """한 인보이스의 Category × Channel 합계 행들"""
     records = []
     for label, type_, col in SUMMARY_ROWS:
         sub = df[df["Type"] == type_]
         rec = {"Invoice No.": invoice_no, "Invoice Date": invoice_date, "Category": label, "Rows": len(sub)}
-        for ch in CHANNELS:
+        for ch in channels:
             rec[ch] = round(sub.loc[sub["Channel"] == ch, col].fillna(0).sum(), 2)
-        rec["Total"] = round(sum(rec[ch] for ch in CHANNELS), 2)
+        rec["Total"] = round(sum(rec[ch] for ch in channels), 2)
         records.append(rec)
     return records
 
 
-def _channel_summary(df):
+def _channel_summary(df, channels):
     """Invoice No.별 Category × Channel 합계표 — 인보이스에 있는 Type만 (Transportation / Duty)"""
     records = []
     for inv, g in df.groupby("Invoice No.", sort=False):   # 업로드한 순서대로
-        records += _summary_records(g, inv, g["Invoice Date"].iloc[0])
+        records += _summary_records(g, inv, g["Invoice Date"].iloc[0], channels)
     out = pd.DataFrame(records)
     return out[out["Rows"] > 0].reset_index(drop=True)   # 해당 Type이 없는 줄(0건)은 숨김
 
@@ -231,9 +231,9 @@ def render_fedex_billing():
     df_all = pd.concat(frames, ignore_index=True)
     df_summary = pd.DataFrame(summaries)
     try:
-        rules = load_rules()
+        rules, channels = load_rules(), list(load_channels())
     except Exception as e:
-        st.error(f"❌ Cannot read Channel Rules from the sheet, so IBD / IBA / RED cannot be decided. "
+        st.error(f"❌ Cannot read Channels / Channel Rules from the sheet, so channels cannot be decided. "
                  f"Please try again in a moment. ({e})")
         return
     if not rules:
@@ -242,6 +242,8 @@ def render_fedex_billing():
     df_all["Channel"] = [channel_for(sec, refs, rules)                      # 현재 규칙으로 다시 구분
                          for sec, refs in zip(df_all["Section"], df_all[CHANNEL_REFS_COL])]
     n_edited = _apply_channel_overrides(df_all)   # 직접 수정한 Channel 반영 (합계 · 다운로드 모두)
+    # 목록에서 지워진 Channel로 직접 수정해 둔 행이 있어도 합계에서 빠지지 않게 뒤에 붙임
+    channels += [c for c in dict.fromkeys(df_all["Channel"]) if c not in channels]
     file_stem = str(df_summary["Invoice No."].iloc[0]) if len(df_summary) == 1 else "fedex_invoices"
 
     # --- 📑 Invoice Summary ---
@@ -266,10 +268,10 @@ def render_fedex_billing():
     if not bad_rows.empty:
         st.warning(f"⚠️ {len(bad_rows)} row(s) could not be fully parsed. See the 'Check' column.")
 
-    # --- 💼 IBD / IBA / RED 합계 ---
+    # --- 💼 Channel별 합계 ---
     st.markdown("---")
     st.markdown("### 💼 Other Charges by Channel")
-    df_channel = _channel_summary(df_all)
+    df_channel = _channel_summary(df_all, channels)
     # 합계표 바로 위: 설명 ……… Download Excel (합계표)
     s1, s2 = st.columns([5, 1], vertical_alignment="bottom")
     s1.caption(
@@ -282,11 +284,11 @@ def render_fedex_billing():
         file_name=f"{file_stem}_channel_summary.xlsx", mime=XLSX_MIME,
         width="stretch", key="fedex_dl_summary",
         help="Other Charges by Channel table below "
-             "(IBD / IBA / RED totals per invoice, manual Channel edits included).",
+             "(totals per channel per invoice, manual Channel edits included).",
     )
     st.dataframe(
         df_channel, width="stretch", hide_index=True,
-        column_config=_money_config(CHANNELS + ["Total"]),
+        column_config=_money_config(channels + ["Total"]),
     )
     if n_edited:
         e1, e2 = st.columns([5, 1], vertical_alignment="center")
@@ -302,8 +304,8 @@ def render_fedex_billing():
     # Channel 필터 ……… Download Excel (상세) — 버튼은 필터 입력칸과 같은 줄 맨 오른쪽
     f1, f2 = st.columns([5, 1], vertical_alignment="bottom")
     with f1.container(key="fedex_filters"):   # key → 'st-key-fedex_filters' 클래스 (CSS 적용 범위)
-        channels = st.multiselect("Channel", CHANNELS, default=CHANNELS, key="fedex_channel_filter")
-    df_ch = df_all[df_all["Channel"].isin(channels)]
+        shown = st.multiselect("Channel", channels, default=channels, key="fedex_channel_filter")
+    df_ch = df_all[df_all["Channel"].isin(shown)]
     f2.download_button(
         "⬇️ Download Excel",
         _to_excel({t: _styled_detail(df_ch[df_ch["Type"] == t], DETAIL_COLS[t])
@@ -334,7 +336,7 @@ def render_fedex_billing():
                 width="stretch", hide_index=True,
                 disabled=[c for c in cols if c != "Channel"],          # Channel만 수정 가능
                 column_config={"Channel": st.column_config.SelectboxColumn(
-                    "Channel ✏️", options=CHANNELS, required=True,
+                    "Channel ✏️", options=channels, required=True,
                     help="Click to change. The change is reflected in 'Other Charges by Channel'.")},
             )
             if _save_channel_edits(df_t, edited):
