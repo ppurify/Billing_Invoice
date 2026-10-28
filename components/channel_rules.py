@@ -33,7 +33,7 @@ ACTIONS = [ADD, CHANGE, DELETE, ADD_CH, DEL_CH]
 CHANNEL_ACTIONS = (ADD_CH, DEL_CH)
 PENDING, APPROVED, REJECTED = "Pending", "Approved", "Rejected"
 STATUSES = [PENDING, APPROVED, REJECTED]
-CACHE_TTL = 60   # 다른 사람이 바꾼 내용이 FedEx 화면에 반영되기까지 최대 시간(초)
+CACHE_TTL = 60   # 화면에 보이는 시트 내용의 최대 나이(초). 다른 사람이 바꾼 내용은 이 시간 안에 반영
 
 CHANNEL_RE = re.compile(r"^[A-Z0-9][A-Z0-9 _-]{0,19}$")
 RESERVED = {"TOTAL", "ROWS", "CATEGORY"}   # FedEx 합계표의 다른 컬럼 이름과 겹치지 않게
@@ -60,31 +60,70 @@ def _insert(items, item, position):
     items.insert(pos, item)
 
 
-# ── Channel 목록 (Channels) ───────────────────────────────────────────
-def read_channels():
-    """(탭, Channel 이름 목록 (Order 순, RED 항상 포함), 시트에 있던 줄 수)"""
-    ws = gsheet.worksheet(CHANNELS_TAB, len(CH_HEADERS))
-    created, rows = gsheet.read_table(ws, CH_HEADERS)
-    if created:   # 처음: RED + 이미 규칙에서 쓰고 있는 Channel
-        _, rules, _ = _raw_rules()
+# ── 시트 읽기 (탭 3개를 요청 1회로) ─────────────────────────────────────
+SPEC = {CHANNELS_TAB: CH_HEADERS, RULES_TAB: RULE_HEADERS, REQUESTS_TAB: REQ_HEADERS}
+
+
+def _last_row(rows):
+    """write_rows가 비워야 할 기존 줄 수 (2행부터)"""
+    return max((r["row"] for r in rows), default=1) - 1
+
+
+def _ws(tab):
+    return gsheet.worksheet(tab, len(SPEC[tab]))
+
+
+def _load():
+    """시트에서 바로 읽기 → {channels, channel_rows, rules, rule_last, requests}"""
+    t = gsheet.read_tables(SPEC)
+    _, rule_rows = t[RULES_TAB]
+    rules = _sorted([r for r in rule_rows if r["Keyword"].strip()], "Priority")
+
+    ch_created, ch_rows = t[CHANNELS_TAB]
+    if ch_created:   # 처음: RED + 이미 규칙에서 쓰고 있는 Channel
         names = list(dict.fromkeys(c for c in (_key(r["Channel"]) for r in rules) if c and c != DEFAULT_CHANNEL))
         names.append(DEFAULT_CHANNEL)
-        rows = [{"Order": i, "Channel": n, "Updated At": gsheet.now(), "Updated By": "system"}
-                for i, n in enumerate(names, start=1)]
-        gsheet.write_rows(ws, CH_HEADERS, rows, 0)
-        return ws, names, len(rows)
-    names = list(dict.fromkeys(_key(r["Channel"]) for r in _sorted(rows, "Order") if _key(r["Channel"])))
+        ch_rows = [{"Order": i, "Channel": n, "Updated At": gsheet.now(), "Updated By": "system", "row": i + 1}
+                   for i, n in enumerate(names, start=1)]
+        gsheet.write_rows(_ws(CHANNELS_TAB), CH_HEADERS, ch_rows, 0)
+    names = list(dict.fromkeys(_key(r["Channel"]) for r in _sorted(ch_rows, "Order") if _key(r["Channel"])))
     if DEFAULT_CHANNEL not in names:
         names.append(DEFAULT_CHANNEL)
-    return ws, names, len(rows)
+
+    gsheet.ensure_dropdown(_ws(RULES_TAB), RULE_HEADERS.index("Channel"), names)
+    gsheet.ensure_dropdown(_ws(REQUESTS_TAB), REQ_HEADERS.index("Status"), STATUSES)
+    return {"channels": names, "channel_rows": ch_rows, "rules": rules,
+            "rule_last": _last_row(rule_rows), "requests": t[REQUESTS_TAB][1]}
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def _cached():
+    return _load()
+
+
+def state(fresh=False):
+    """화면 표시용은 캐시(최대 CACHE_TTL초 전 내용), 저장 · 승인할 때는 fresh=True로 시트에서 바로 읽음"""
+    return _load() if fresh else _cached()
+
+
+def refresh():
+    """시트를 바꾼 뒤 · 새로고침 버튼: 다음 화면에서 시트를 다시 읽도록"""
+    _cached.clear()
+
+
 def load_channels():
     """FedEx 화면용 Channel 이름 (Order 순)"""
-    return tuple(read_channels()[1])
+    return tuple(state()["channels"])
 
 
+def load_rules():
+    """FedEx 화면용: ((키워드, Channel), ...) — Priority 순. 목록에 없는 Channel의 규칙은 건너뜀"""
+    s = state()
+    channels = set(s["channels"])
+    return tuple((r["Keyword"].strip(), _key(r["Channel"])) for r in s["rules"] if _key(r["Channel"]) in channels)
+
+
+# ── Channel 목록 (Channels) ───────────────────────────────────────────
 def validate_channels(names, rules):
     """Channel 목록 확인 → 오류 메시지 목록"""
     errors, seen = [], set()
@@ -104,10 +143,9 @@ def validate_channels(names, rules):
     return errors
 
 
-def save_channels(names, by):
-    ws, old, old_count = read_channels()
-    _, raw_rows = gsheet.read_table(ws, CH_HEADERS)
-    old_info = {_key(r["Channel"]): r for r in raw_rows}
+def save_channels(names, by, s=None):
+    s = s or state(fresh=True)
+    old_info = {_key(r["Channel"]): r for r in s["channel_rows"]}
     out = []
     for i, n in enumerate(names, start=1):
         prev = old_info.get(n)
@@ -115,10 +153,9 @@ def save_channels(names, by):
         out.append({"Order": i, "Channel": n,
                     "Updated At": prev["Updated At"] if same else gsheet.now(),
                     "Updated By": prev["Updated By"] if same else by})
-    gsheet.write_rows(ws, CH_HEADERS, out, old_count)
-    gsheet.ensure_dropdown(_rules_ws(), RULE_HEADERS.index("Channel"), names)   # 규칙 탭 드롭다운도 새 목록으로
-    load_channels.clear()
-    load_rules.clear()
+    gsheet.write_rows(_ws(CHANNELS_TAB), CH_HEADERS, out, _last_row(s["channel_rows"]))
+    gsheet.ensure_dropdown(_ws(RULES_TAB), RULE_HEADERS.index("Channel"), names)   # 규칙 탭 드롭다운도 새 목록으로
+    refresh()
 
 
 def apply_channel_change(names, rules, action, name, order=None):
@@ -147,37 +184,10 @@ def apply_channel_change(names, rules, action, name, order=None):
 
 
 # ── 규칙 (Channel Rules) ─────────────────────────────────────────────
-def _rules_ws():
-    return gsheet.worksheet(RULES_TAB, len(RULE_HEADERS))
-
-
-def _raw_rules():
-    ws = _rules_ws()
-    _, rows = gsheet.read_table(ws, RULE_HEADERS)
-    return ws, _sorted([r for r in rows if r["Keyword"].strip()], "Priority"), len(rows)
-
-
-def read_rules(channels=None):
-    """(탭, 현재 규칙 [{Priority, Keyword, Channel, Updated At, Updated By}] (Priority 순), 시트에 있던 줄 수)
-    channels를 주면 Channel 컬럼 드롭다운도 그 목록으로 맞춤"""
-    ws, rules, n = _raw_rules()
-    if channels:
-        gsheet.ensure_dropdown(ws, RULE_HEADERS.index("Channel"), list(channels))
-    return ws, rules, n
-
-
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def load_rules():
-    """FedEx 화면용: ((키워드, Channel), ...) — Priority 순. 목록에 없는 Channel의 규칙은 건너뜀"""
-    channels = set(load_channels())
-    _, rules, _ = _raw_rules()
-    return tuple((r["Keyword"].strip(), _key(r["Channel"])) for r in rules if _key(r["Channel"]) in channels)
-
-
-def save_rules(rules, by):
+def save_rules(rules, by, s=None):
     """규칙 목록을 순서대로 Priority 1, 2, 3 … 으로 저장. 내용이 바뀐 규칙만 Updated At / By 갱신"""
-    ws, old, old_count = _raw_rules()
-    old_by_key = {_key(r["Keyword"]): r for r in old}
+    s = s or state(fresh=True)
+    old_by_key = {_key(r["Keyword"]): r for r in s["rules"]}
     out = []
     for i, r in enumerate(rules, start=1):
         prev = old_by_key.get(_key(r["Keyword"]))
@@ -185,8 +195,8 @@ def save_rules(rules, by):
         out.append({"Priority": i, "Keyword": r["Keyword"].strip(), "Channel": _key(r["Channel"]),
                     "Updated At": prev["Updated At"] if same else gsheet.now(),
                     "Updated By": prev["Updated By"] if same else by})
-    gsheet.write_rows(ws, RULE_HEADERS, out, old_count)
-    load_rules.clear()
+    gsheet.write_rows(_ws(RULES_TAB), RULE_HEADERS, out, s["rule_last"])
+    refresh()
 
 
 def validate_rules(rules, channels):
@@ -241,62 +251,49 @@ def describe(action, keyword, channel=None, priority=None):
 
 
 # ── 요청 (Rule Requests) ─────────────────────────────────────────────
-def _requests_ws():
-    ws = gsheet.worksheet(REQUESTS_TAB, len(REQ_HEADERS))
-    gsheet.ensure_dropdown(ws, REQ_HEADERS.index("Status"), STATUSES)
-    return ws
-
-
-def read_requests():
-    ws = _requests_ws()
-    _, rows = gsheet.read_table(ws, REQ_HEADERS)
-    return ws, rows
-
-
-def _check(action, keyword, channel, priority):
-    """지금 시트 기준으로 적용 가능한 요청인지 → (Channel 목록, 규칙 목록, 새 목록, 오류)"""
-    _, channels, _ = read_channels()
-    _, rules, _ = _raw_rules()
+def _check(s, action, keyword, channel, priority):
+    """지금 시트 기준으로 적용 가능한 요청인지 → (새 목록, 오류)"""
     if action in CHANNEL_ACTIONS:
-        new, err = apply_channel_change(channels, rules, action, channel, priority)
-    else:
-        if not (keyword or "").strip():
-            return channels, rules, None, "Please enter a keyword."
-        if action != DELETE and _key(channel) not in channels:
-            return channels, rules, None, "Please choose a channel from the list."
-        new, err = apply_change(rules, action, keyword, channel, priority)
-    return channels, rules, new, err
+        return apply_channel_change(s["channels"], s["rules"], action, channel, priority)
+    if not (keyword or "").strip():
+        return None, "Please enter a keyword."
+    if action != DELETE and _key(channel) not in s["channels"]:
+        return None, "Please choose a channel from the list."
+    return apply_change(s["rules"], action, keyword, channel, priority)
 
 
 def submit_request(username, action, keyword, channel, priority, reason):
     """사용자 요청 저장 → 오류 메시지 또는 None"""
     if action in CHANNEL_ACTIONS and not _key(channel):
         return "Please enter a channel name."
-    *_, err = _check(action, keyword, channel, priority)
+    _, err = _check(state(fresh=True), action, keyword, channel, priority)
     if err:
         return err
-    ws, _ = read_requests()
-    ws.append_row([gsheet.now(), username, action,
-                   "" if action in CHANNEL_ACTIONS else (keyword or "").strip(),
-                   "" if action == DELETE else _key(channel),
-                   "" if priority is None else int(priority), (reason or "").strip(), "", "", PENDING])
+    gsheet.append_row(_ws(REQUESTS_TAB), [
+        gsheet.now(), username, action,
+        "" if action in CHANNEL_ACTIONS else (keyword or "").strip(),
+        "" if action == DELETE else _key(channel),
+        "" if priority is None else int(priority), (reason or "").strip(), "", "", PENDING])
+    refresh()
     return None
 
 
 def review_request(req, approve, admin):
     """요청 승인(바로 반영) 또는 거절 → 오류 메시지 또는 None"""
     if approve:
-        _, _, new, err = _check(req["Action"], req["Keyword"], req["Channel"] or None, _to_int(req["Priority"]))
+        s = state(fresh=True)
+        new, err = _check(s, req["Action"], req["Keyword"], req["Channel"] or None, _to_int(req["Priority"]))
         if err:
             return f"Cannot apply: {err}"
         by = f"{admin} (request by {req['Requested By']})"
         if req["Action"] in CHANNEL_ACTIONS:
-            save_channels(new, by)
+            save_channels(new, by, s)
         else:
-            save_rules(new, by)
+            save_rules(new, by, s)
     c = REQ_HEADERS.index
-    _requests_ws().batch_update([
+    gsheet.batch_update(_ws(REQUESTS_TAB), [
         {"range": f"{gsheet.col_letter(c('Reviewed At'))}{req['row']}:{gsheet.col_letter(c('Status'))}{req['row']}",
          "values": [[gsheet.now(), admin, APPROVED if approve else REJECTED]]},
     ])
+    refresh()
     return None

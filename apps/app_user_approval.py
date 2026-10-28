@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from components.theme import apply_theme
-from components.auth import current_user, load_users, set_statuses, STATUSES, PENDING
+from components.auth import current_user, list_users, set_statuses, STATUSES, PENDING
 
 apply_theme()
 st.title("User Approval")
@@ -22,7 +22,7 @@ if not user or not user.get("is_admin"):
     st.stop()
 
 try:
-    _, users = load_users()
+    users = list_users()
 except Exception as e:
     st.error(f"❌ Cannot read the Users sheet: {e}")
     st.stop()
@@ -40,6 +40,7 @@ n_pending = int((df["Status"] == PENDING).sum())
 c1, c2 = st.columns([4, 1], vertical_alignment="center")
 c1.metric("Waiting for approval", n_pending)
 if c2.button("🔄 Refresh", width="stretch", key="approval_refresh"):
+    list_users.clear()
     st.rerun()
 
 edited = st.data_editor(

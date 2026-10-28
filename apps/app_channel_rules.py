@@ -22,14 +22,17 @@ user = current_user()
 is_admin = bool(user and user.get("is_admin"))
 EDITOR_VER = "rules_editor_ver"
 
-st.caption("Rules are checked from the top (Priority 1 first). The first keyword found in "
+t1, t2 = st.columns([5, 1], vertical_alignment="center")
+t1.caption("Rules are checked from the top (Priority 1 first). The first keyword found in "
            "P.O.# / Ref.#2 / Cust. Ref. decides the channel (case-insensitive). "
            f"No match → {cr.DEFAULT_CHANNEL}. Other Charges are always {cr.DEFAULT_CHANNEL}.")
+if t2.button("🔄 Refresh", width="stretch", key="rules_refresh",
+             help=f"Read the sheet again (otherwise refreshed every {cr.CACHE_TTL} s)"):
+    cr.refresh()
 
 try:
-    _, channels, _ = cr.read_channels()
-    _, rules, _ = cr.read_rules(channels)
-    _, requests = cr.read_requests()
+    s = cr.state()   # 탭 3개를 한 번에 읽고 잠시 재사용 (Google Sheets 읽기 한도 때문)
+    channels, rules, requests = s["channels"], s["rules"], s["requests"]
 except Exception as e:
     st.error(f"❌ Cannot read the rules sheet: {e}")
     st.stop()

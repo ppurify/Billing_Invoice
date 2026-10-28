@@ -54,12 +54,18 @@ def _norm(username):
 
 
 def load_users():
-    """시트의 모든 사용자 → (탭, [{컬럼: 값, 'row': 시트 행 번호}])
+    """시트의 모든 사용자 (시트에서 바로 읽음, 요청 1회) → (탭, [{컬럼: 값, 'row': 시트 행 번호}])
     시트가 비어 있으면 첫 줄에 양식(HEADERS)을 자동으로 채우고, Status는 드롭다운으로 설정합니다."""
     ws = _worksheet()
     _, users = gsheet.read_table(ws, HEADERS)
     gsheet.ensure_dropdown(ws, COL["Status"], STATUSES)
     return ws, [u for u in users if u["Username"].strip()]
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def list_users():
+    """User Approval 화면용 (최대 30초 재사용 — 표를 고칠 때마다 시트를 읽지 않게)"""
+    return load_users()[1]
 
 
 def _find(users, username):
@@ -87,7 +93,8 @@ def sign_up(username, name, password, password2):
     pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
     row = {"Name": name, "Username": username, "Password Hash": pw_hash,
            "Requested At": gsheet.now(), "Reviewed At": "", "Status": PENDING}
-    ws.append_row([row[h] for h in HEADERS])   # RAW 입력 (수식으로 해석 안 됨)
+    gsheet.append_row(ws, [row[h] for h in HEADERS])
+    list_users.clear()
     return None
 
 
@@ -123,7 +130,8 @@ def set_statuses(changes):
     for row, status in changes.items():
         data.append({"range": f"{s}{row}", "values": [[status]]})
         data.append({"range": f"{t}{row}", "values": [[now]]})
-    ws.batch_update(data)
+    gsheet.batch_update(ws, data)
+    list_users.clear()
 
 
 # ── 화면 ─────────────────────────────────────────────────────────────
