@@ -9,6 +9,12 @@ Channel 목록 · 구분 규칙 (구글 시트에 저장, 코드에는 없음)
                   처음 만들어지면 비어 있음 → 관리자가 페이지에서 입력
   Rule Requests : 사용자의 변경 요청. 관리자가 Approve 하면 그때 반영
 
+승인 방법 (둘 다 같음)
+  - 앱 'Channel Rules' 페이지의 ✅ Approve 버튼
+  - 구글 시트 'Rule Requests' 탭에서 Status를 Approved로 변경
+    → 다음에 앱이 시트를 읽을 때(최대 CACHE_TTL초 안) 자동으로 반영하고 Reviewed At / By를 채움
+    → 반영할 수 없는 요청(이미 있는 Channel 등)은 Status를 Pending으로 되돌리고 Reviewed By에 이유를 적음
+
 요청 종류
   Add / Change / Delete           : 키워드 규칙 추가 · 변경 · 삭제
   Add Channel / Delete Channel    : Channel 추가 · 삭제 (규칙에서 쓰고 있는 Channel은 삭제 불가)
@@ -74,6 +80,14 @@ def _ws(tab):
 
 
 def _load():
+    """시트에서 바로 읽기. 시트에서 승인한 요청이 있으면 반영한 뒤 다시 읽음"""
+    s = _read()
+    if _apply_sheet_approvals(s):
+        s = _read()
+    return s
+
+
+def _read():
     """시트에서 바로 읽기 → {channels, channel_rows, rules, rule_last, requests}"""
     t = gsheet.read_tables(SPEC)
     _, rule_rows = t[RULES_TAB]
@@ -144,7 +158,11 @@ def validate_channels(names, rules):
 
 
 def save_channels(names, by, s=None):
-    s = s or state(fresh=True)
+    _write_channels(names, by, s or state(fresh=True))
+    refresh()
+
+
+def _write_channels(names, by, s):
     old_info = {_key(r["Channel"]): r for r in s["channel_rows"]}
     out = []
     for i, n in enumerate(names, start=1):
@@ -155,7 +173,6 @@ def save_channels(names, by, s=None):
                     "Updated By": prev["Updated By"] if same else by})
     gsheet.write_rows(_ws(CHANNELS_TAB), CH_HEADERS, out, _last_row(s["channel_rows"]))
     gsheet.ensure_dropdown(_ws(RULES_TAB), RULE_HEADERS.index("Channel"), names)   # 규칙 탭 드롭다운도 새 목록으로
-    refresh()
 
 
 def apply_channel_change(names, rules, action, name, order=None):
@@ -186,7 +203,11 @@ def apply_channel_change(names, rules, action, name, order=None):
 # ── 규칙 (Channel Rules) ─────────────────────────────────────────────
 def save_rules(rules, by, s=None):
     """규칙 목록을 순서대로 Priority 1, 2, 3 … 으로 저장. 내용이 바뀐 규칙만 Updated At / By 갱신"""
-    s = s or state(fresh=True)
+    _write_rules(rules, by, s or state(fresh=True))
+    refresh()
+
+
+def _write_rules(rules, by, s):
     old_by_key = {_key(r["Keyword"]): r for r in s["rules"]}
     out = []
     for i, r in enumerate(rules, start=1):
@@ -196,7 +217,6 @@ def save_rules(rules, by, s=None):
                     "Updated At": prev["Updated At"] if same else gsheet.now(),
                     "Updated By": prev["Updated By"] if same else by})
     gsheet.write_rows(_ws(RULES_TAB), RULE_HEADERS, out, s["rule_last"])
-    refresh()
 
 
 def validate_rules(rules, channels):
@@ -297,3 +317,35 @@ def review_request(req, approve, admin):
     ])
     refresh()
     return None
+
+
+def _apply_sheet_approvals(s):
+    """시트에서 Status를 Approved로 바꿨지만 아직 반영 안 된 요청(Reviewed At 비어 있음)을 순서대로 반영.
+    반영한 게 있으면 True"""
+    todo = [r for r in s["requests"]
+            if r["Status"].strip().capitalize() == APPROVED and not r["Reviewed At"].strip()]
+    if not todo:
+        return False
+    cur = {"channels": list(s["channels"]), "rules": [dict(r) for r in s["rules"]]}
+    ch_changed = rule_changed = False
+    updates = []
+    for req in todo:
+        new, err = _check(cur, req["Action"], req["Keyword"], req["Channel"] or None, _to_int(req["Priority"]))
+        if err:   # 반영 불가 → Pending으로 되돌리고 이유 표시 (관리자가 앱에서 확인)
+            updates.append((req["row"], "", f"Not applied: {err}", PENDING))
+            continue
+        if req["Action"] in CHANNEL_ACTIONS:
+            cur["channels"], ch_changed = new, True
+        else:
+            cur["rules"], rule_changed = new, True
+        updates.append((req["row"], gsheet.now(), "admin (sheet)", APPROVED))
+    by = "admin (sheet)"
+    if ch_changed:
+        _write_channels(cur["channels"], by, s)
+    if rule_changed:
+        _write_rules(cur["rules"], by, s)
+    c = REQ_HEADERS.index
+    a, z = gsheet.col_letter(c("Reviewed At")), gsheet.col_letter(c("Status"))
+    gsheet.batch_update(_ws(REQUESTS_TAB), [{"range": f"{a}{row}:{z}{row}", "values": [[at, who, status]]}
+                                           for row, at, who, status in updates])
+    return ch_changed or rule_changed

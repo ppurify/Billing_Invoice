@@ -87,6 +87,8 @@ ver = st.session_state.get(EDITOR_VER, 0)
 if is_admin:
     pending = [r for r in requests if r["Status"].strip().capitalize() == cr.PENDING]
     st.markdown(f"### 📬 Pending Requests ({len(pending)})")
+    st.caption("Approve here, or set Status to Approved in the 'Rule Requests' sheet "
+               f"(applied automatically within {cr.CACHE_TTL} s).")
     if not pending:
         st.caption("No pending requests.")
     for req in pending:
@@ -95,6 +97,8 @@ if is_admin:
             c1.markdown(f"**{cr.describe(req['Action'], req['Keyword'], req['Channel'], req['Priority'])}**")
             c1.caption(f"by {req['Requested By']} · {req['Requested At']}"
                        + (f" · Reason: {req['Reason']}" if req["Reason"].strip() else ""))
+            if req["Reviewed By"].startswith("Not applied"):   # 시트에서 승인했지만 반영할 수 없었던 요청
+                c1.warning(req["Reviewed By"])
             for col, label, approve in ((c2, "✅ Approve", True), (c3, "✖️ Reject", False)):
                 if col.button(label, key=f"req_{'ok' if approve else 'no'}_{req['row']}", width="stretch"):
                     try:
