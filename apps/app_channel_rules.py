@@ -163,16 +163,11 @@ if is_admin:
 # 사용자
 # ==============================================================================
 else:
-    c1, c2 = st.columns([1, 3])
-    with c1:
-        st.markdown("### 🗂️ Channels")
-        st.dataframe(_channels_df(channels, rules), width="stretch", hide_index=True)
-    with c2:
-        st.markdown("### 📋 Current Rules")
-        if rules:
-            st.dataframe(_rules_df(rules), width="stretch", hide_index=True)
-        else:
-            st.caption(f"No rules. Every shipment is {cr.DEFAULT_CHANNEL}.")
+    st.markdown("### 📋 Current Rules")
+    if rules:
+        st.dataframe(_rules_df(rules), width="stretch", hide_index=True)
+    else:
+        st.caption(f"No rules. Every shipment is {cr.DEFAULT_CHANNEL}.")
 
     st.markdown("---")
     st.markdown("### 📝 Request a Change")
